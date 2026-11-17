@@ -1,79 +1,138 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The staged screenshot scenes behind ?shot=title|chase|foot|coast. Each one builds a real
+// moment of the game — a police chase mid-mission, a package pickup on foot, a run down the
+// coast road — by placing the actors and then stepping the true simulation forward with a
+// scripted driver, so what the camera captures is the game as it actually plays, and the
+// same seed always stages the same frame.
+(function () {
+  'use strict';
+  var NH = window.NH = window.NH || {};
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+  var IDLE = {
+    axisX: function () { return 0; }, axisY: function () { return 0; },
+    throttle: function () { return 0; }, steer: function () { return 0; },
+    handbrake: function () { return false; }, sprint: function () { return false; },
+    punchHeld: function () { return false; },
+  };
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
+  function driving(throttle) {
+    return {
+      axisX: function () { return 0; }, axisY: function () { return 0; },
+      throttle: function () { return throttle; }, steer: function () { return 0; },
+      handbrake: function () { return false; }, sprint: function () { return false; },
+      punchHeld: function () { return false; },
+    };
+  }
+
+  function walking(x, y) {
+    return {
+      axisX: function () { return x; }, axisY: function () { return y; },
+      throttle: function () { return 0; }, steer: function () { return 0; },
+      handbrake: function () { return false; }, sprint: function () { return false; },
+      punchHeld: function () { return false; },
+    };
+  }
+
+  function stepFor(world, input, seconds) {
+    var steps = Math.round(seconds / NH.STEP);
+    for (var i = 0; i < steps; i++) world.step(input, 0, NH.STEP);
+  }
+
+  function findCar(state, predicate) {
+    for (var i = 0; i < state.cars.length; i++) if (predicate(state.cars[i])) return state.cars[i];
+    return null;
+  }
+
+  // Put the player in a car at a place, as if they had just climbed in.
+  function putPlayerInCar(state, car, x, y, angle, carKind, color) {
+    car.x = x; car.y = y; car.angle = angle; car.speed = 0;
+    car.vx = 0; car.vy = 0;
+    if (carKind) { car.carKind = carKind; var spec = NH.CAR_KINDS[carKind]; car.health = spec.health; car.maxHealth = spec.health; }
+    if (color) car.color = color;
+    car.driver = 'player';
+    car.everOwned = true;
+    state.player.inCar = car;
+    state.player.x = x; state.player.y = y;
+    return car;
+  }
+
+  // Turn a traffic car into a police car on the player's tail.
+  function makePolice(state, x, y, angle) {
+    var car = findCar(state, function (c) { return c.kind === 'traffic'; });
+    if (!car) return null;
+    car.kind = 'police';
+    car.carKind = 'police';
+    car.color = '#f5f6fa';
+    car.health = NH.CAR_KINDS.police.health;
+    car.maxHealth = car.health;
+    car.x = x; car.y = y; car.angle = angle; car.speed = 60;
+    car.driver = 'ai';
+    car.policeState = 'chase';
+    return car;
+  }
+
+  NH.stageShot = function (name, world) {
+    var state = world.state;
+
+    if (name === 'chase') {
+      // Harbor Sprint, checkpoint 1 ahead, three stars and two police cars behind.
+      state.money = 620;
+      state.missionsDone = 3;
+      state.missionIndex = 3;
+      state.nextMissionIn = 0;
+      NH.startMission(state);
+      var car = findCar(state, function (c) { return c.kind === 'parked'; }) || state.cars[0];
+      putPlayerInCar(state, car, 886, 1180, -Math.PI / 2, 'sport', '#e74c3c');
+      state.setWanted(3);
+      makePolice(state, 872, 1320, -Math.PI / 2);
+      makePolice(state, 905, 1412, -Math.PI / 2);
+      state.lastSeen.x = car.x; state.lastSeen.y = car.y;
+      stepFor(world, driving(1), 1.05);
+      state.events.length = 0;
+      return { screen: NH.SCREEN.PLAY };
     }
-  }
-  return Infinity;
-}
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
+    if (name === 'foot') {
+      // Package Run: on foot, closing on the package behind the Casa Azul.
+      state.money = 150;
+      state.missionsDone = 1;
+      state.missionIndex = 1;
+      state.nextMissionIn = 0;
+      NH.startMission(state);
+      state.player.x = 1895;
+      state.player.y = 548;
+      state.player.angle = 0;
+      // A couple of locals on the pavement, so the street feels lived in.
+      if (state.peds[0]) { state.peds[0].x = 2005; state.peds[0].y = 462; }
+      if (state.peds[1]) { state.peds[1].x = 1972; state.peds[1].y = 646; }
+      stepFor(world, walking(1, 0), 0.55);
+      state.events.length = 0;
+      return { screen: NH.SCREEN.PLAY };
     }
-  }
-  return best;
-}
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
-  }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
-}
+    if (name === 'coast') {
+      // A late-run cruise down the coast avenue toward the Harbor Steps, one star up.
+      state.money = 1890;
+      state.missionsDone = 5;
+      state.missionIndex = 5;
+      state.nextMissionIn = 0;
+      state.mission = {
+        kind: 'reach', title: 'Harbor Run', payout: 300, timeLeft: 0, totalTime: 0,
+        stage: 0, layLow: 0, cpIndex: 0, checkpoints: null, targetCar: null,
+        target: { x: state.city.landmarks.harbor.x, y: state.city.landmarks.harbor.y, label: 'Harbor Steps' },
+      };
+      var car2 = findCar(state, function (c) { return c.kind === 'parked'; }) || state.cars[0];
+      putPlayerInCar(state, car2, 3074, 880, Math.PI / 2, 'sedan', '#3498db');
+      state.setWanted(1);
+      makePolice(state, 3074, 600, Math.PI / 2);
+      state.lastSeen.x = car2.x; state.lastSeen.y = car2.y;
+      stepFor(world, driving(1), 1.3);
+      state.events.length = 0;
+      return { screen: NH.SCREEN.PLAY };
+    }
+
+    // Anything else is the title: the city idling behind the menu.
+    stepFor(world, IDLE, 4);
+    state.events.length = 0;
+    return { screen: NH.SCREEN.TITLE };
+  };
+})();
